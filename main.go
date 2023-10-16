@@ -8,13 +8,19 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
+	"sync"
 	"syscall"
 	"time"
+
+	"golang.org/x/sync/semaphore"
 )
 
 type Data struct {
 	value string
 }
+
+const maxWorkers = 5
 
 func main() {
 	rb := NewRingBuffer[Data](1000)
@@ -35,27 +41,41 @@ func main() {
 	}()
 
 	stopWorker := make(chan struct{})
-	workerDone := make(chan struct{})
-	go func(stopCh <-chan struct{}, doneCh chan<- struct{}) {
-		defer close(doneCh)
-		for {
-			select {
-			case <-stopCh:
-				log.Println("Stopping worker...")
-				time.Sleep(3 * time.Second)
-				log.Println("Worker stopped.")
-				return
-			default:
-				d, err := rb.Dequeue()
-				if err != nil {
-					log.Printf("Error: %v", err)
-				} else {
-					log.Printf("Dequeued: %v", d)
-				}
-				time.Sleep(2 * time.Second)
-			}
+	sem := semaphore.NewWeighted(maxWorkers)
+	var wg sync.WaitGroup
+
+	for i := 0; i < maxWorkers; i++ {
+		if err := sem.Acquire(context.Background(), 1); err != nil {
+			log.Printf("Failed to acquire semaphore: %v", err)
+			break
 		}
-	}(stopWorker, workerDone)
+		wg.Add(1)
+		go func(stopCh <-chan struct{}) {
+			defer func() {
+				wg.Done()
+				sem.Release(1)
+			}()
+			for {
+				select {
+				case <-stopCh:
+					log.Println("Stopping worker...")
+					time.Sleep(3 * time.Second)
+					log.Println("Worker stopped.")
+					return
+				default:
+					fmt.Printf("Currently %d goroutines are running.\n", runtime.NumGoroutine())
+					d, err := rb.Dequeue()
+					if err != nil {
+						log.Printf("Error: %v", err)
+					} else {
+						log.Printf("Dequeued: %v", d)
+					}
+					time.Sleep(2 * time.Second)
+				}
+			}
+		}(stopWorker)
+	}
+
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	select {
@@ -70,6 +90,6 @@ func main() {
 		srv.Shutdown(ctx)
 		slog.InfoContext(ctx, "worker shutdownを開始")
 		close(stopWorker)
-		<-workerDone
+		wg.Wait()
 	}
 }
